@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>메모장</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+    <!-- 왼쪽 사이드바: 노트북 목록 -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h1 class="logo"><i class="fa-solid fa-feather-pointed"></i> 메모장</h1>
+      </div>
+      <div class="sidebar-actions">
+        <button id="btn-new-note" class="btn-primary">
+          <i class="fa-solid fa-plus"></i> 새 메모
+        </button>
+      </div>
+      <nav class="sidebar-nav">
+        <div class="nav-item active" data-filter="all">
+          <i class="fa-solid fa-note-sticky"></i>
+          <span>모든 메모</span>
+          <span class="note-count" id="count-all">0</span>
+        </div>
+        <div class="nav-item" data-filter="starred">
+          <i class="fa-solid fa-star"></i>
+          <span>중요 메모</span>
+          <span class="note-count" id="count-starred">0</span>
+        </div>
+        <div class="nav-item" data-filter="trash">
+          <i class="fa-solid fa-trash"></i>
+          <span>휴지통</span>
+          <span class="note-count" id="count-trash">0</span>
+        </div>
+      </nav>
+      <div class="notebook-section">
+        <div class="section-header">
+          <span>노트북</span>
+          <button id="btn-new-notebook" class="btn-icon" title="새 노트북">
+            <i class="fa-solid fa-plus"></i>
+          </button>
+        </div>
+        <div id="notebook-list" class="notebook-list"></div>
+      </div>
+      <div class="tag-section">
+        <div class="section-header">
+          <span>태그</span>
+        </div>
+        <div id="tag-list" class="tag-list"></div>
+      </div>
+    </aside>
+
+    <!-- 중간 패널: 노트 목록 -->
+    <section id="note-list-panel">
+      <div class="panel-header">
+        <h2 id="panel-title">모든 메모</h2>
+        <div class="search-box">
+          <i class="fa-solid fa-magnifying-glass"></i>
+          <input type="text" id="search-input" placeholder="메모 검색...">
+        </div>
+        <div class="sort-controls">
+          <select id="sort-select">
+            <option value="updated">수정일순</option>
+            <option value="created">생성일순</option>
+            <option value="title">제목순</option>
+          </select>
+        </div>
+      </div>
+      <div id="note-list" class="note-list"></div>
+    </section>
+
+    <!-- 오른쪽 패널: 메모 편집기 -->
+    <main id="editor-panel">
+      <div id="editor-empty" class="editor-empty">
+        <i class="fa-solid fa-feather-pointed"></i>
+        <p>메모를 선택하거나 새 메모를 작성하세요</p>
+      </div>
+      <div id="editor-content" class="editor-content" style="display:none;">
+        <div class="editor-toolbar">
+          <div class="toolbar-left">
+            <button class="btn-icon" id="btn-note-notebook" title="노트북 변경">
+              <i class="fa-solid fa-book"></i>
+              <span id="editor-notebook-name">기본 노트북</span>
+            </button>
+          </div>
+          <div class="toolbar-right">
+            <button class="btn-icon" id="btn-toggle-star" title="중요 표시">
+              <i class="fa-regular fa-star"></i>
+            </button>
+            <button class="btn-icon" id="btn-delete-note" title="삭제">
+              <i class="fa-solid fa-trash"></i>
+            </button>
+            <button class="btn-icon" id="btn-restore-note" title="복원" style="display:none;">
+              <i class="fa-solid fa-rotate-left"></i>
+            </button>
+            <button class="btn-icon" id="btn-permanent-delete" title="영구 삭제" style="display:none;">
+              <i class="fa-solid fa-trash-can"></i>
+            </button>
+          </div>
+        </div>
+        <input type="text" id="editor-title" class="editor-title" placeholder="제목 없음">
+        <div class="editor-meta">
+          <div class="tag-input-wrapper">
+            <i class="fa-solid fa-tags"></i>
+            <div id="editor-tags" class="editor-tags"></div>
+            <input type="text" id="tag-input" class="tag-input" placeholder="태그 추가 (Enter)">
+          </div>
+          <span id="editor-date" class="editor-date"></span>
+        </div>
+        <div class="formatting-toolbar">
+          <button class="fmt-btn" data-command="bold" title="굵게"><i class="fa-solid fa-bold"></i></button>
+          <button class="fmt-btn" data-command="italic" title="기울임"><i class="fa-solid fa-italic"></i></button>
+          <button class="fmt-btn" data-command="underline" title="밑줄"><i class="fa-solid fa-underline"></i></button>
+          <button class="fmt-btn" data-command="strikeThrough" title="취소선"><i class="fa-solid fa-strikethrough"></i></button>
+          <div class="toolbar-divider"></div>
+          <button class="fmt-btn" data-command="insertUnorderedList" title="목록"><i class="fa-solid fa-list-ul"></i></button>
+          <button class="fmt-btn" data-command="insertOrderedList" title="번호 목록"><i class="fa-solid fa-list-ol"></i></button>
+          <div class="toolbar-divider"></div>
+          <button class="fmt-btn" data-command="formatBlock-h1" title="제목 1"><b>H1</b></button>
+          <button class="fmt-btn" data-command="formatBlock-h2" title="제목 2"><b>H2</b></button>
+          <button class="fmt-btn" data-command="formatBlock-h3" title="제목 3"><b>H3</b></button>
+          <button class="fmt-btn" data-command="formatBlock-p" title="본문"><b>P</b></button>
+          <div class="toolbar-divider"></div>
+          <button class="fmt-btn" data-command="insertHorizontalRule" title="구분선"><i class="fa-solid fa-minus"></i></button>
+          <button class="fmt-btn" data-command="removeFormat" title="서식 제거"><i class="fa-solid fa-eraser"></i></button>
+        </div>
+        <div id="editor-body" class="editor-body" contenteditable="true"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 노트북 선택 드롭다운 -->
+  <div id="notebook-dropdown" class="dropdown-menu" style="display:none;"></div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
