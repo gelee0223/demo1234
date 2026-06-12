@@ -1,0 +1,21 @@
+databases:
+  - name: memo-db
+    plan: free
+    databaseName: memo_app
+    user: memo_user
+
+services:
+  - type: web
+    name: memo-app
+    runtime: node
+    plan: free
+    rootDir: memo-app
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: memo-db
+          property: connectionString
+      - key: NODE_ENV
+        value: production
