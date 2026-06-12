@@ -1,9 +1,3 @@
-databases:
-  - name: memo-db
-    plan: free
-    databaseName: memo_app
-    user: memo_user
-
 services:
   - type: web
     name: memo-app
@@ -12,9 +6,9 @@ services:
     buildCommand: npm install
     startCommand: node server.js
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: memo-db
-          property: connectionString
+      - key: TURSO_URL
+        sync: false
+      - key: TURSO_TOKEN
+        sync: false
       - key: NODE_ENV
         value: production

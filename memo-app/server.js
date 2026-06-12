@@ -1,14 +1,15 @@
 const express = require('express');
-const { Pool } = require('pg');
+const { createClient } = require('@libsql/client');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- PostgreSQL 연결 ---
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+// --- Turso DB 연결 ---
+const db = createClient({
+  url: process.env.TURSO_URL,
+  authToken: process.env.TURSO_TOKEN,
 });
 
 // --- 미들웨어 ---
@@ -17,61 +18,65 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // --- DB 초기화 ---
 async function initDB() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS notebooks (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(255) UNIQUE NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS notebooks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS notes (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        title VARCHAR(500) DEFAULT '',
-        content TEXT DEFAULT '',
-        notebook_id INTEGER REFERENCES notebooks(id) ON DELETE SET NULL,
-        starred BOOLEAN DEFAULT false,
-        trashed BOOLEAN DEFAULT false,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id TEXT PRIMARY KEY,
+      title TEXT DEFAULT '',
+      content TEXT DEFAULT '',
+      notebook_id INTEGER REFERENCES notebooks(id) ON DELETE SET NULL,
+      starred INTEGER DEFAULT 0,
+      trashed INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS note_tags (
-        id SERIAL PRIMARY KEY,
-        note_id UUID REFERENCES notes(id) ON DELETE CASCADE,
-        tag VARCHAR(100) NOT NULL,
-        UNIQUE(note_id, tag)
-      )
-    `);
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS note_tags (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      note_id TEXT REFERENCES notes(id) ON DELETE CASCADE,
+      tag TEXT NOT NULL,
+      UNIQUE(note_id, tag)
+    )
+  `);
 
-    // 기본 노트북 생성
-    await client.query(`
-      INSERT INTO notebooks (name) VALUES ('기본 노트북')
-      ON CONFLICT (name) DO NOTHING
-    `);
+  await db.execute(`
+    INSERT OR IGNORE INTO notebooks (name) VALUES ('기본 노트북')
+  `);
 
-    console.log('DB 초기화 완료');
-  } finally {
-    client.release();
+  console.log('DB 초기화 완료');
+}
+
+// --- 헬퍼: 노트에 태그 목록 붙이기 ---
+async function attachTags(notes) {
+  for (const note of notes) {
+    const tagResult = await db.execute({
+      sql: 'SELECT tag FROM note_tags WHERE note_id = ?',
+      args: [note.id],
+    });
+    note.tags = tagResult.rows.map(function (r) { return r.tag; });
+    note.starred = !!note.starred;
+    note.trashed = !!note.trashed;
   }
+  return notes;
 }
 
 // ===== API: 노트북 =====
 
-// 노트북 목록 조회
 app.get('/api/notebooks', async (req, res) => {
   try {
-    const result = await pool.query(`
+    const result = await db.execute(`
       SELECT nb.id, nb.name,
-        COUNT(n.id) FILTER (WHERE n.trashed = false) AS note_count
+        (SELECT COUNT(*) FROM notes n WHERE n.notebook_id = nb.id AND n.trashed = 0) AS note_count
       FROM notebooks nb
-      LEFT JOIN notes n ON n.notebook_id = nb.id
-      GROUP BY nb.id, nb.name
       ORDER BY nb.created_at
     `);
     res.json(result.rows);
@@ -81,7 +86,6 @@ app.get('/api/notebooks', async (req, res) => {
   }
 });
 
-// 노트북 생성
 app.post('/api/notebooks', async (req, res) => {
   const { name } = req.body;
   if (!name || !name.trim()) {
@@ -89,13 +93,17 @@ app.post('/api/notebooks', async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      'INSERT INTO notebooks (name) VALUES ($1) RETURNING *',
-      [name.trim()]
-    );
-    res.status(201).json(result.rows[0]);
+    const result = await db.execute({
+      sql: 'INSERT INTO notebooks (name) VALUES (?)',
+      args: [name.trim()],
+    });
+    const nb = await db.execute({
+      sql: 'SELECT * FROM notebooks WHERE id = ?',
+      args: [result.lastInsertRowid],
+    });
+    res.status(201).json(nb.rows[0]);
   } catch (err) {
-    if (err.code === '23505') {
+    if (err.message && err.message.includes('UNIQUE')) {
       return res.status(409).json({ error: '이미 존재하는 노트북입니다' });
     }
     console.error('노트북 생성 오류:', err);
@@ -103,90 +111,73 @@ app.post('/api/notebooks', async (req, res) => {
   }
 });
 
-// 노트북 삭제 (메모는 기본 노트북으로 이동)
 app.delete('/api/notebooks/:id', async (req, res) => {
   const { id } = req.params;
-  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
-
-    // 기본 노트북 확인
-    const defaultNb = await client.query(
+    const defaultNb = await db.execute(
       "SELECT id FROM notebooks WHERE name = '기본 노트북'"
     );
     if (defaultNb.rows.length === 0) {
-      await client.query('ROLLBACK');
       return res.status(500).json({ error: '기본 노트북을 찾을 수 없습니다' });
     }
 
     const defaultId = defaultNb.rows[0].id;
 
-    // 기본 노트북은 삭제 불가
-    if (parseInt(id) === defaultId) {
-      await client.query('ROLLBACK');
+    if (Number(id) === Number(defaultId)) {
       return res.status(400).json({ error: '기본 노트북은 삭제할 수 없습니다' });
     }
 
-    // 해당 노트북의 메모를 기본 노트북으로 이동
-    await client.query(
-      'UPDATE notes SET notebook_id = $1 WHERE notebook_id = $2',
-      [defaultId, id]
-    );
+    await db.execute({
+      sql: 'UPDATE notes SET notebook_id = ? WHERE notebook_id = ?',
+      args: [defaultId, id],
+    });
 
-    // 노트북 삭제
-    await client.query('DELETE FROM notebooks WHERE id = $1', [id]);
+    await db.execute({
+      sql: 'DELETE FROM notebooks WHERE id = ?',
+      args: [id],
+    });
 
-    await client.query('COMMIT');
     res.json({ success: true });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('노트북 삭제 오류:', err);
     res.status(500).json({ error: '서버 오류' });
-  } finally {
-    client.release();
   }
 });
 
 // ===== API: 노트 =====
 
-// 노트 목록 조회
 app.get('/api/notes', async (req, res) => {
   const { filter, notebook_id, tag, search, sort } = req.query;
 
   try {
-    let whereClause = '';
-    const params = [];
+    let whereClause = 'WHERE n.trashed = 0';
+    const args = [];
 
     if (filter === 'starred') {
-      whereClause = 'WHERE n.starred = true AND n.trashed = false';
+      whereClause = 'WHERE n.starred = 1 AND n.trashed = 0';
     } else if (filter === 'trash') {
-      whereClause = 'WHERE n.trashed = true';
+      whereClause = 'WHERE n.trashed = 1';
     } else if (notebook_id) {
-      whereClause = 'WHERE n.notebook_id = $1 AND n.trashed = false';
-      params.push(notebook_id);
+      whereClause = 'WHERE n.notebook_id = ? AND n.trashed = 0';
+      args.push(notebook_id);
     } else if (tag) {
-      whereClause = `WHERE n.trashed = false AND EXISTS (
-        SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND nt.tag = $1
+      whereClause = `WHERE n.trashed = 0 AND EXISTS (
+        SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND nt.tag = ?
       )`;
-      params.push(tag);
-    } else {
-      whereClause = 'WHERE n.trashed = false';
+      args.push(tag);
     }
 
-    // 검색
     if (search && search.trim()) {
       const searchParam = `%${search.trim().toLowerCase()}%`;
-      const paramIdx = params.length + 1;
       whereClause += ` AND (
-        LOWER(n.title) LIKE $${paramIdx}
-        OR LOWER(n.content) LIKE $${paramIdx}
-        OR EXISTS (SELECT 1 FROM note_tags nt2 WHERE nt2.note_id = n.id AND LOWER(nt2.tag) LIKE $${paramIdx})
+        LOWER(n.title) LIKE ?
+        OR LOWER(n.content) LIKE ?
+        OR EXISTS (SELECT 1 FROM note_tags nt2 WHERE nt2.note_id = n.id AND LOWER(nt2.tag) LIKE ?)
       )`;
-      params.push(searchParam);
+      args.push(searchParam, searchParam, searchParam);
     }
 
-    // 정렬
     let orderClause = 'ORDER BY n.updated_at DESC';
     if (sort === 'created') {
       orderClause = 'ORDER BY n.created_at DESC';
@@ -194,130 +185,129 @@ app.get('/api/notes', async (req, res) => {
       orderClause = 'ORDER BY n.title ASC';
     }
 
-    const result = await pool.query(`
-      SELECT n.id, n.title, n.content, n.notebook_id, nb.name AS notebook_name,
-        n.starred, n.trashed, n.created_at, n.updated_at,
-        COALESCE(
-          (SELECT json_agg(nt.tag) FROM note_tags nt WHERE nt.note_id = n.id),
-          '[]'::json
-        ) AS tags
-      FROM notes n
-      LEFT JOIN notebooks nb ON nb.id = n.notebook_id
-      ${whereClause}
-      ${orderClause}
-    `, params);
+    const result = await db.execute({
+      sql: `
+        SELECT n.id, n.title, n.content, n.notebook_id, nb.name AS notebook_name,
+          n.starred, n.trashed, n.created_at, n.updated_at
+        FROM notes n
+        LEFT JOIN notebooks nb ON nb.id = n.notebook_id
+        ${whereClause}
+        ${orderClause}
+      `,
+      args,
+    });
 
-    res.json(result.rows);
+    const notes = await attachTags(result.rows);
+    res.json(notes);
   } catch (err) {
     console.error('노트 목록 조회 오류:', err);
     res.status(500).json({ error: '서버 오류' });
   }
 });
 
-// 노트 생성
 app.post('/api/notes', async (req, res) => {
   const { notebook_id } = req.body;
-  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
-
     let nbId = notebook_id;
     if (!nbId) {
-      const defaultNb = await client.query(
+      const defaultNb = await db.execute(
         "SELECT id FROM notebooks WHERE name = '기본 노트북'"
       );
       nbId = defaultNb.rows[0].id;
     }
 
-    const result = await client.query(
-      'INSERT INTO notes (notebook_id) VALUES ($1) RETURNING *',
-      [nbId]
-    );
+    const noteId = crypto.randomUUID();
+
+    await db.execute({
+      sql: 'INSERT INTO notes (id, notebook_id) VALUES (?, ?)',
+      args: [noteId, nbId],
+    });
+
+    const result = await db.execute({
+      sql: `SELECT n.*, nb.name AS notebook_name
+            FROM notes n LEFT JOIN notebooks nb ON nb.id = n.notebook_id
+            WHERE n.id = ?`,
+      args: [noteId],
+    });
 
     const note = result.rows[0];
+    note.tags = [];
+    note.starred = !!note.starred;
+    note.trashed = !!note.trashed;
 
-    const nbResult = await client.query(
-      'SELECT name FROM notebooks WHERE id = $1',
-      [nbId]
-    );
-
-    await client.query('COMMIT');
-
-    res.status(201).json({
-      ...note,
-      notebook_name: nbResult.rows[0].name,
-      tags: [],
-    });
+    res.status(201).json(note);
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('노트 생성 오류:', err);
     res.status(500).json({ error: '서버 오류' });
-  } finally {
-    client.release();
   }
 });
 
-// 노트 수정
 app.put('/api/notes/:id', async (req, res) => {
   const { id } = req.params;
   const { title, content, notebook_id, starred, trashed } = req.body;
 
   try {
-    const fields = [];
-    const params = [];
-    let paramIdx = 1;
+    const sets = [];
+    const args = [];
 
     if (title !== undefined) {
-      fields.push(`title = $${paramIdx++}`);
-      params.push(title);
+      sets.push('title = ?');
+      args.push(title);
     }
     if (content !== undefined) {
-      fields.push(`content = $${paramIdx++}`);
-      params.push(content);
+      sets.push('content = ?');
+      args.push(content);
     }
     if (notebook_id !== undefined) {
-      fields.push(`notebook_id = $${paramIdx++}`);
-      params.push(notebook_id);
+      sets.push('notebook_id = ?');
+      args.push(notebook_id);
     }
     if (starred !== undefined) {
-      fields.push(`starred = $${paramIdx++}`);
-      params.push(starred);
+      sets.push('starred = ?');
+      args.push(starred ? 1 : 0);
     }
     if (trashed !== undefined) {
-      fields.push(`trashed = $${paramIdx++}`);
-      params.push(trashed);
+      sets.push('trashed = ?');
+      args.push(trashed ? 1 : 0);
     }
 
-    if (fields.length === 0) {
+    if (sets.length === 0) {
       return res.status(400).json({ error: '수정할 필드가 없습니다' });
     }
 
-    fields.push('updated_at = NOW()');
-    params.push(id);
+    sets.push("updated_at = datetime('now')");
+    args.push(id);
 
-    const result = await pool.query(
-      `UPDATE notes SET ${fields.join(', ')} WHERE id = $${paramIdx} RETURNING *`,
-      params
-    );
+    await db.execute({
+      sql: `UPDATE notes SET ${sets.join(', ')} WHERE id = ?`,
+      args,
+    });
+
+    const result = await db.execute({
+      sql: 'SELECT * FROM notes WHERE id = ?',
+      args: [id],
+    });
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: '노트를 찾을 수 없습니다' });
     }
 
-    res.json(result.rows[0]);
+    const note = result.rows[0];
+    note.starred = !!note.starred;
+    note.trashed = !!note.trashed;
+    res.json(note);
   } catch (err) {
     console.error('노트 수정 오류:', err);
     res.status(500).json({ error: '서버 오류' });
   }
 });
 
-// 노트 영구 삭제
 app.delete('/api/notes/:id', async (req, res) => {
   const { id } = req.params;
 
   try {
-    await pool.query('DELETE FROM notes WHERE id = $1', [id]);
+    await db.execute({ sql: 'DELETE FROM notes WHERE id = ?', args: [id] });
     res.json({ success: true });
   } catch (err) {
     console.error('노트 삭제 오류:', err);
@@ -327,14 +317,13 @@ app.delete('/api/notes/:id', async (req, res) => {
 
 // ===== API: 태그 =====
 
-// 모든 태그 목록
 app.get('/api/tags', async (req, res) => {
   try {
-    const result = await pool.query(`
+    const result = await db.execute(`
       SELECT nt.tag, COUNT(*) AS count
       FROM note_tags nt
       JOIN notes n ON n.id = nt.note_id
-      WHERE n.trashed = false
+      WHERE n.trashed = 0
       GROUP BY nt.tag
       ORDER BY nt.tag
     `);
@@ -345,7 +334,6 @@ app.get('/api/tags', async (req, res) => {
   }
 });
 
-// 노트에 태그 추가
 app.post('/api/notes/:id/tags', async (req, res) => {
   const { id } = req.params;
   const { tag } = req.body;
@@ -355,11 +343,14 @@ app.post('/api/notes/:id/tags', async (req, res) => {
   }
 
   try {
-    await pool.query(
-      'INSERT INTO note_tags (note_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [id, tag.trim()]
-    );
-    await pool.query('UPDATE notes SET updated_at = NOW() WHERE id = $1', [id]);
+    await db.execute({
+      sql: 'INSERT OR IGNORE INTO note_tags (note_id, tag) VALUES (?, ?)',
+      args: [id, tag.trim()],
+    });
+    await db.execute({
+      sql: "UPDATE notes SET updated_at = datetime('now') WHERE id = ?",
+      args: [id],
+    });
     res.status(201).json({ success: true });
   } catch (err) {
     console.error('태그 추가 오류:', err);
@@ -367,16 +358,18 @@ app.post('/api/notes/:id/tags', async (req, res) => {
   }
 });
 
-// 노트에서 태그 삭제
 app.delete('/api/notes/:noteId/tags/:tag', async (req, res) => {
   const { noteId, tag } = req.params;
 
   try {
-    await pool.query(
-      'DELETE FROM note_tags WHERE note_id = $1 AND tag = $2',
-      [noteId, decodeURIComponent(tag)]
-    );
-    await pool.query('UPDATE notes SET updated_at = NOW() WHERE id = $1', [noteId]);
+    await db.execute({
+      sql: 'DELETE FROM note_tags WHERE note_id = ? AND tag = ?',
+      args: [noteId, decodeURIComponent(tag)],
+    });
+    await db.execute({
+      sql: "UPDATE notes SET updated_at = datetime('now') WHERE id = ?",
+      args: [noteId],
+    });
     res.json({ success: true });
   } catch (err) {
     console.error('태그 삭제 오류:', err);
